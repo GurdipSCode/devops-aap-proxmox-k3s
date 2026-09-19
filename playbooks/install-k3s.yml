@@ -1,0 +1,157 @@
+---
+- name: Prepare every K3s node
+  hosts: k3s_cluster
+  become: true
+  gather_facts: true
+
+  vars:
+    k3s_install_script_url: https://get.k3s.io
+    k3s_install_script_path: /usr/local/src/install-k3s.sh
+    k3s_version: ""
+
+  tasks:
+    - name: Wait for SSH after cloud-init
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command:
+        cmd: cloud-init status --wait
+      register: cloud_init_status
+      changed_when: false
+
+    - name: Install operating-system dependencies
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - qemu-guest-agent
+        state: present
+        update_cache: true
+
+    - name: Enable the QEMU guest agent
+      ansible.builtin.systemd_service:
+        name: qemu-guest-agent
+        enabled: true
+        state: started
+
+    - name: Download the official K3s installation script
+      ansible.builtin.get_url:
+        url: "{{ k3s_install_script_url }}"
+        dest: "{{ k3s_install_script_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+- name: Install the first K3s server
+  hosts: k3s_server
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    k3s_install_script_path: /usr/local/src/install-k3s.sh
+    k3s_version: ""
+    k3s_server_args: "--write-kubeconfig-mode 0640"
+
+  tasks:
+    - name: Ensure exactly one initial server is selected
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_server'] | length == 1
+        fail_msg: This starter project supports exactly one initial K3s server.
+      run_once: true
+
+    - name: Install K3s server
+      ansible.builtin.command:
+        cmd: "{{ k3s_install_script_path }}"
+        creates: /etc/systemd/system/k3s.service
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        INSTALL_K3S_EXEC: "server {{ k3s_server_args }}"
+      notify: Restart K3s server
+
+    - name: Ensure the K3s server is running
+      ansible.builtin.systemd_service:
+        name: k3s
+        enabled: true
+        state: started
+
+    - name: Wait for the Kubernetes API
+      ansible.builtin.wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 6443
+        timeout: 300
+
+    - name: Read the K3s node token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_raw
+      no_log: true
+
+    - name: Store the join token on the first server host
+      ansible.builtin.set_fact:
+        k3s_join_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+      no_log: true
+
+  handlers:
+    - name: Restart K3s server
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: restarted
+
+- name: Join K3s agents
+  hosts: k3s_agents
+  become: true
+  gather_facts: false
+
+  vars:
+    k3s_install_script_path: /usr/local/src/install-k3s.sh
+    k3s_version: ""
+    k3s_primary_server: "{{ groups['k3s_server'][0] }}"
+    k3s_server_url: >-
+      https://{{ hostvars[k3s_primary_server].ansible_host |
+      default(hostvars[k3s_primary_server].ansible_default_ipv4.address) }}:6443
+
+  tasks:
+    - name: Install K3s agent
+      ansible.builtin.command:
+        cmd: "{{ k3s_install_script_path }}"
+        creates: /etc/systemd/system/k3s-agent.service
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        K3S_URL: "{{ k3s_server_url }}"
+        K3S_TOKEN: "{{ hostvars[k3s_primary_server].k3s_join_token }}"
+      no_log: true
+
+    - name: Ensure the K3s agent is running
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        enabled: true
+        state: started
+
+- name: Verify the K3s cluster
+  hosts: k3s_server
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Wait for all nodes to register
+      ansible.builtin.command:
+        cmd: k3s kubectl get nodes --no-headers
+      register: registered_nodes
+      changed_when: false
+      retries: 20
+      delay: 15
+      until: registered_nodes.stdout_lines | length == groups['k3s_cluster'] | length
+
+    - name: Display cluster nodes
+      ansible.builtin.command:
+        cmd: k3s kubectl get nodes -o wide
+      register: cluster_nodes
+      changed_when: false
+
+    - name: Show final cluster state
+      ansible.builtin.debug:
+        var: cluster_nodes.stdout_lines
+

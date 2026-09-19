@@ -1,0 +1,179 @@
+---
+- name: Create a Proxmox cloud-init template for K3s nodes
+  hosts: proxmox
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - ../vars/template.yml
+
+  tasks:
+    - name: Validate required template variables
+      ansible.builtin.assert:
+        that:
+          - template_vmid | int > 0
+          - template_name | length > 0
+          - proxmox_storage | length > 0
+          - proxmox_bridge | length > 0
+          - cloud_init_ssh_public_key | length > 0
+        fail_msg: >-
+          Supply a valid template ID, storage, bridge and
+          cloud_init_ssh_public_key. Use an AAP Survey for the public key.
+
+    - name: Check whether the configured VM ID exists
+      ansible.builtin.command:
+        cmd: "qm status {{ template_vmid }}"
+      register: template_status
+      changed_when: false
+      failed_when: false
+
+    - name: Read existing VM configuration
+      ansible.builtin.command:
+        cmd: "qm config {{ template_vmid }}"
+      register: existing_template_config
+      changed_when: false
+      failed_when: false
+      when: template_status.rc == 0
+
+    - name: Refuse to overwrite an existing non-template VM
+      ansible.builtin.assert:
+        that:
+          - rebuild_template | bool or 'template: 1' in existing_template_config.stdout
+        fail_msg: >-
+          VM ID {{ template_vmid }} exists but is not a template. Select a
+          different template_vmid or inspect and remove that VM manually.
+      when: template_status.rc == 0
+
+    - name: Stop existing template before intentional rebuild
+      ansible.builtin.command:
+        cmd: "qm stop {{ template_vmid }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - template_status.rc == 0
+        - rebuild_template | bool
+
+    - name: Destroy existing template during intentional rebuild
+      ansible.builtin.command:
+        cmd: "qm destroy {{ template_vmid }} --purge 1"
+      changed_when: true
+      when:
+        - template_status.rc == 0
+        - rebuild_template | bool
+
+    - name: Mark template build as required
+      ansible.builtin.set_fact:
+        build_template: "{{ template_status.rc != 0 or rebuild_template | bool }}"
+
+    - name: Build the Proxmox template
+      when: build_template | bool
+      block:
+        - name: Ensure the cloud-image directory exists
+          ansible.builtin.file:
+            path: "{{ cloud_image_directory }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Download the current Ubuntu cloud image
+          ansible.builtin.get_url:
+            url: "{{ cloud_image_url }}"
+            dest: "{{ cloud_image_directory }}/{{ cloud_image_filename }}"
+            owner: root
+            group: root
+            mode: "0644"
+            force: true
+          register: cloud_image_download
+
+        - name: Create temporary SSH public-key file
+          ansible.builtin.copy:
+            content: "{{ cloud_init_ssh_public_key }}\n"
+            dest: "/tmp/aap-{{ template_vmid }}-authorized-key.pub"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Create the empty VM definition
+          ansible.builtin.command:
+            cmd: >-
+              qm create {{ template_vmid }}
+              --name {{ template_name }}
+              --description {{ template_description | quote }}
+              --ostype l26
+              --cores {{ template_cores }}
+              --memory {{ template_memory_mb }}
+              --cpu {{ template_cpu_type }}
+              --agent enabled=1
+              --scsihw virtio-scsi-single
+              --net0 virtio,bridge={{ proxmox_bridge }},firewall=1
+              --serial0 socket
+              --vga serial0
+          changed_when: true
+
+        - name: Import the cloud-image disk
+          ansible.builtin.command:
+            cmd: >-
+              qm importdisk {{ template_vmid }}
+              {{ cloud_image_directory }}/{{ cloud_image_filename }}
+              {{ proxmox_storage }}
+          changed_when: true
+
+        - name: Read the imported disk volume
+          ansible.builtin.shell:
+            cmd: >-
+              set -o pipefail &&
+              qm config {{ template_vmid }} |
+              awk -F ': ' '/^unused0:/ {print $2}'
+            executable: /bin/bash
+          register: imported_disk
+          changed_when: false
+
+        - name: Validate the imported disk was found
+          ansible.builtin.assert:
+            that:
+              - imported_disk.stdout | trim | length > 0
+            fail_msg: The cloud disk imported, but its Proxmox volume ID was not found.
+
+        - name: Attach the imported disk and cloud-init drive
+          ansible.builtin.command:
+            cmd: >-
+              qm set {{ template_vmid }}
+              --scsi0 {{ imported_disk.stdout | trim }},discard=on,iothread=1,ssd=1
+              --ide2 {{ proxmox_storage }}:cloudinit
+              --boot order=scsi0
+              --ciuser {{ cloud_init_user }}
+              --sshkeys /tmp/aap-{{ template_vmid }}-authorized-key.pub
+              --ipconfig0 ip=dhcp
+          changed_when: true
+
+        - name: Resize the operating-system disk
+          ansible.builtin.command:
+            cmd: "qm resize {{ template_vmid }} scsi0 {{ template_disk_size }}"
+          changed_when: true
+
+        - name: Convert the VM into a template
+          ansible.builtin.command:
+            cmd: "qm template {{ template_vmid }}"
+          changed_when: true
+
+      always:
+        - name: Remove temporary SSH public-key file
+          ansible.builtin.file:
+            path: "/tmp/aap-{{ template_vmid }}-authorized-key.pub"
+            state: absent
+
+    - name: Verify the resulting template
+      ansible.builtin.command:
+        cmd: "qm config {{ template_vmid }}"
+      register: final_template_config
+      changed_when: false
+
+    - name: Assert that Proxmox reports a template
+      ansible.builtin.assert:
+        that:
+          - "'template: 1' in final_template_config.stdout"
+        success_msg: >-
+          Proxmox template {{ template_name }} (VM ID {{ template_vmid }}) is ready.
+

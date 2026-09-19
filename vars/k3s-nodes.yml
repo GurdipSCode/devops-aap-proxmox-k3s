@@ -1,0 +1,34 @@
+---
+template_vmid: 9000
+proxmox_storage: local-lvm
+proxmox_bridge: vmbr0
+cloud_init_user: ubuntu
+cloud_init_ssh_public_key: ""
+
+rebuild_nodes: false
+
+k3s_nodes:
+  - vmid: 9101
+    name: k3s-server-01
+    role: server
+    cores: 2
+    memory_mb: 4096
+    ip_address: 192.168.10.101/24
+    gateway: 192.168.10.1
+
+  - vmid: 9111
+    name: k3s-agent-01
+    role: agent
+    cores: 2
+    memory_mb: 4096
+    ip_address: 192.168.10.111/24
+    gateway: 192.168.10.1
+
+  - vmid: 9112
+    name: k3s-agent-02
+    role: agent
+    cores: 2
+    memory_mb: 4096
+    ip_address: 192.168.10.112/24
+    gateway: 192.168.10.1
+

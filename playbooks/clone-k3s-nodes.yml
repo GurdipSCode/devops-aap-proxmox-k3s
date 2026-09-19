@@ -1,0 +1,125 @@
+---
+- name: Clone K3s nodes from the Proxmox template
+  hosts: proxmox
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - ../vars/k3s-nodes.yml
+
+  tasks:
+    - name: Validate clone variables
+      ansible.builtin.assert:
+        that:
+          - template_vmid | int > 0
+          - k3s_nodes | length > 0
+          - cloud_init_ssh_public_key | length > 0
+        fail_msg: Supply the template VM ID, node definitions and public SSH key.
+
+    - name: Verify the source template exists
+      ansible.builtin.command:
+        cmd: "qm config {{ template_vmid }}"
+      register: source_template
+      changed_when: false
+
+    - name: Verify the source is a template
+      ansible.builtin.assert:
+        that:
+          - "'template: 1' in source_template.stdout"
+        fail_msg: "VM ID {{ template_vmid }} is not a Proxmox template."
+
+    - name: Create temporary SSH public-key file
+      ansible.builtin.copy:
+        content: "{{ cloud_init_ssh_public_key }}\n"
+        dest: "/tmp/aap-k3s-authorized-key.pub"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+
+    - name: Check whether target VM IDs exist
+      ansible.builtin.command:
+        cmd: "qm status {{ item.vmid }}"
+      loop: "{{ k3s_nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.vmid }})"
+      register: node_statuses
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing nodes during intentional rebuild
+      ansible.builtin.command:
+        cmd: "qm stop {{ item.item.vmid }}"
+      loop: "{{ node_statuses.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - item.rc == 0
+        - rebuild_nodes | bool
+
+    - name: Destroy existing nodes during intentional rebuild
+      ansible.builtin.command:
+        cmd: "qm destroy {{ item.item.vmid }} --purge 1"
+      loop: "{{ node_statuses.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      changed_when: true
+      when:
+        - item.rc == 0
+        - rebuild_nodes | bool
+
+    - name: Clone missing K3s nodes
+      ansible.builtin.command:
+        cmd: >-
+          qm clone {{ template_vmid }} {{ item.item.vmid }}
+          --name {{ item.item.name }}
+          --full 1
+          --storage {{ proxmox_storage }}
+      loop: "{{ node_statuses.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      changed_when: true
+      when: item.rc != 0 or rebuild_nodes | bool
+
+    - name: Configure newly cloned nodes
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ item.item.vmid }}
+          --cores {{ item.item.cores }}
+          --memory {{ item.item.memory_mb }}
+          --net0 virtio,bridge={{ proxmox_bridge }},firewall=1
+          --ciuser {{ cloud_init_user }}
+          --sshkeys /tmp/aap-k3s-authorized-key.pub
+          --ipconfig0 ip={{ item.item.ip_address }},gw={{ item.item.gateway }}
+          --nameserver {{ item.item.nameserver | default(item.item.gateway) }}
+      loop: "{{ node_statuses.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      changed_when: true
+      when: item.rc != 0 or rebuild_nodes | bool
+
+    - name: Start newly cloned nodes
+      ansible.builtin.command:
+        cmd: "qm start {{ item.item.vmid }}"
+      loop: "{{ node_statuses.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      changed_when: true
+      when: item.rc != 0 or rebuild_nodes | bool
+
+    - name: Remove temporary SSH public-key file
+      ansible.builtin.file:
+        path: /tmp/aap-k3s-authorized-key.pub
+        state: absent
+
+    - name: Display created nodes
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }} ({{ item.role }}) is configured as VM ID {{ item.vmid }}
+          at {{ item.ip_address }}.
+      loop: "{{ k3s_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+

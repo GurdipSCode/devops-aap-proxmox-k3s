@@ -1,0 +1,25 @@
+---
+# Proxmox template settings
+proxmox_storage: local-lvm
+proxmox_bridge: vmbr0
+
+template_vmid: 9000
+template_name: ubuntu-2404-k3s-base
+template_description: Ubuntu 24.04 cloud-init base image for K3s nodes
+
+template_cores: 2
+template_memory_mb: 4096
+template_disk_size: 20G
+template_cpu_type: host
+
+cloud_init_user: ubuntu
+cloud_init_ssh_public_key: ""
+
+# Ubuntu 24.04 LTS Noble cloud image
+cloud_image_url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+cloud_image_directory: /var/lib/vz/template/iso
+cloud_image_filename: noble-server-cloudimg-amd64.img
+
+# Set only for an intentional template refresh.
+rebuild_template: false
+
