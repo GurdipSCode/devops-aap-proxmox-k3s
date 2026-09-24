@@ -1,4 +1,4 @@
-# AAP Proxmox K3s Automation
+# AAP Proxmox K3s Automation s
 
 This repository contains three AAP-ready playbooks:
 
